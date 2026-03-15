@@ -1,18 +1,18 @@
-# AIM - Advanced Idea Mechanics
+# AIM
 
-Real-time WebSocket relay server for AI assistants. Routes commands, token streams, and audio between devices.
+Real time WebSocket relay server for AI assistants which routes commands, token streams and audio between devices.
 
 ```
   Watch ──┐
   Phone ──┤──→ AIM Server ──→ AI Backend
-  Mac   ──┤     (relay)       (JARVIS, etc.)
+  Mac   ──┤     (relay)       ([JARVIS](https://jarvis.arhan.dev))
   Web   ──┘
 ```
 
 ## Quick Start
 
 ```bash
-npm install aim-relay-server
+npm install aim
 ```
 
 ### Start the server
@@ -30,7 +30,7 @@ AIM_PORT=5225 AIM_AUTH_TOKEN=my-secret npx aim
 ### Connect a client
 
 ```typescript
-import { AIMClient } from 'aim-relay-server/client';
+import { AIMClient } from 'aim/client';
 
 const client = new AIMClient({
   url: 'ws://localhost:5225',
@@ -99,18 +99,8 @@ Use `respondTo: "mac"` to have the AI backend respond on the Mac, or `respondTo:
 
 ## Architecture
 
-AIM is a **relay** — it doesn't process commands itself. It routes messages between devices and an AI backend (like JARVIS). The backend registers as a `mac` or `cli` device and receives commands from other devices.
+AIM is a relay, it doesn't process commands itself. It routes messages between devices and an AI backend (JARVIS in my case). The backend registers as a `mac` or `cli` device and receives commands from other devices
 
-```
-┌─────────┐     ┌─────────────┐     ┌──────────┐
-│  Phone  │────→│  AIM Relay  │────→│  JARVIS  │
-│  Watch  │────→│  (VPS)      │←────│  (Mac)   │
-│  Web    │←────│             │     │          │
-└─────────┘     └─────────────┘     └──────────┘
-```
 
 The Mac runs JARVIS locally with all its features (voice, system control, menubar). It connects to AIM as a client, receives commands from remote devices, and sends responses back through AIM.
 
-## License
-
-MIT
