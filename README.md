@@ -5,7 +5,7 @@ Real time WebSocket relay server for AI assistants which routes commands, token 
 ```
   Watch ──┐
   Phone ──┤──→ AIM Server ──→ AI Backend
-  Mac   ──┤     (relay)       ([JARVIS](https://jarvis.arhan.dev))
+  Mac   ──┤     (relay)        (JARVIS)
   Web   ──┘
 ```
 
