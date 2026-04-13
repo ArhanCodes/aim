@@ -33,7 +33,7 @@ AIM_PORT=5225 AIM_AUTH_TOKEN=my-secret npx aim
 import { AIMClient } from 'aim/client';
 
 const client = new AIMClient({
-  url: 'ws://localhost:5225',
+  url: 'wss://relay.example.com',
   device: 'phone',
   name: 'iPhone',
   token: 'my-secret',
@@ -79,7 +79,7 @@ AIM uses a JSON-based WebSocket protocol. Every message has a `type` field:
 ### Authentication
 
 Pass token via:
-- URL param: `ws://host:5225?token=xxx`
+- URL param: `wss://relay.example.com?token=xxx`
 - Header: `X-AIM-Token: xxx`
 - Bearer: `Authorization: Bearer xxx`
 
@@ -96,6 +96,28 @@ Messages can be routed to specific devices:
 ```
 
 Use `respondTo: "mac"` to have the AI backend respond on the Mac, or `respondTo: "phone"` to respond on the phone.
+
+### Secure Transport (TLS / `wss://`)
+
+Use `wss://` for any networked deployment:
+
+```typescript
+const client = new AIMClient({
+  url: 'wss://relay.example.com',
+  device: 'phone',
+  token: process.env.AIM_TOKEN,
+});
+```
+
+`AIMClient` accepts both `ws://` and `wss://` URLs. For production, terminate TLS in front of AIM with a reverse proxy such as Caddy or Nginx and forward the upgraded WebSocket connection to the local AIM process (`ws://127.0.0.1:5225`). Example Caddyfile:
+
+```caddy
+relay.example.com {
+  reverse_proxy 127.0.0.1:5225
+}
+```
+
+Then connect clients with `wss://relay.example.com`. Keep `ws://localhost:5225` only for local development on a trusted machine.
 
 ## Architecture
 

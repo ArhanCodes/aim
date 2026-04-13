@@ -11,7 +11,8 @@ import type {
   RegisterMessage,
   CommandMessage,
   ConnectedDevice,
-  DeviceType,
+  AckMessage,
+  ErrorMessage,
 } from './types.js';
 
 interface DeviceConnection {
@@ -19,24 +20,72 @@ interface DeviceConnection {
   device: ConnectedDevice;
 }
 
+type CommandHandler = (msg: CommandMessage, from: ConnectedDevice) => void;
+
+interface RelayResilienceConfig {
+  offlineMessageTtlMs: number;
+  retryBaseMs: number;
+  retryCapMs: number;
+  ackTimeoutMs: number;
+}
+
+interface PendingDelivery {
+  targetHints: string[];
+  message: AIMMessage;
+  createdAt: number;
+  expiresAt: number;
+  attempts: number;
+  requireAck: boolean;
+  retryTimer: NodeJS.Timeout | null;
+  ackTimer: NodeJS.Timeout | null;
+  awaitingAck: boolean;
+}
+
+const DEFAULT_RESILIENCE_CONFIG: RelayResilienceConfig = {
+  offlineMessageTtlMs: 60000,
+  retryBaseMs: 1000,
+  retryCapMs: 30000,
+  ackTimeoutMs: 5000,
+};
+
+const CRITICAL_MESSAGE_TYPES = new Set<AIMMessage['type']>([
+  'command',
+  'response',
+  'status',
+  'error',
+  'system_command',
+  'system_command_result',
+  'play_audio',
+]);
+
 export class AIMRelay {
   private devices: Map<string, DeviceConnection> = new Map();
   private heartbeatInterval: NodeJS.Timeout | null = null;
-  private commandHandler: ((msg: CommandMessage, from: ConnectedDevice) => void) | null = null;
+  private commandHandlers: CommandHandler[] = [];
+  private pendingDeliveries: Map<string, PendingDelivery> = new Map();
+  private resilienceConfig: RelayResilienceConfig;
 
-  constructor(private heartbeatMs: number = 30000) {}
-
-  /**
-   * Register a handler for incoming commands.
-   * This is how the AI backend (e.g., JARVIS) hooks in.
-   */
-  onCommand(handler: (msg: CommandMessage, from: ConnectedDevice) => void): void {
-    this.commandHandler = handler;
+  constructor(
+    private heartbeatMs: number = 30000,
+    resilienceConfig: Partial<RelayResilienceConfig> = {},
+  ) {
+    this.resilienceConfig = {
+      ...DEFAULT_RESILIENCE_CONFIG,
+      ...resilienceConfig,
+    };
   }
 
-  /**
-   * Register a new device connection.
-   */
+  onCommand(handler: CommandHandler): void {
+    this.commandHandlers.push(handler);
+  }
+
+  offCommand(handler: CommandHandler): void {
+    const index = this.commandHandlers.indexOf(handler);
+    if (index >= 0) {
+      this.commandHandlers.splice(index, 1);
+    }
+  }
+
   registerDevice(ws: WebSocket, msg: RegisterMessage): string {
     const id = msg.from || uuid();
     const device: ConnectedDevice = {
@@ -48,7 +97,6 @@ export class AIMRelay {
       lastSeen: Date.now(),
     };
 
-    // Close existing connection for same device ID (but not if it's the same socket re-registering)
     const existing = this.devices.get(id);
     if (existing && existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN) {
       existing.ws.close(1000, 'Replaced by new connection');
@@ -56,15 +104,14 @@ export class AIMRelay {
 
     this.devices.set(id, { ws, device });
 
-    // Send registration ack with device ID
     this.send(ws, {
       type: 'ack',
+      ackType: 'register',
       deviceId: id,
       message: `Registered as ${device.deviceName}`,
       connectedDevices: this.getDeviceList(),
     });
 
-    // Notify all other devices
     this.broadcast({
       type: 'status',
       state: 'device_connected',
@@ -72,13 +119,11 @@ export class AIMRelay {
       connectedDevices: this.getDeviceList(),
     }, id);
 
+    this.flushPendingDeliveriesFor(device);
     console.log(`[AIM] Device registered: ${device.deviceName} (${device.deviceType}) [${id}]`);
     return id;
   }
 
-  /**
-   * Handle an incoming message from a device.
-   */
   handleMessage(deviceId: string, raw: string): void {
     const conn = this.devices.get(deviceId);
     if (!conn) return;
@@ -87,22 +132,29 @@ export class AIMRelay {
 
     let msg: AIMMessage;
     try {
-      msg = JSON.parse(raw);
+      msg = JSON.parse(raw) as AIMMessage;
     } catch {
       this.send(conn.ws, { type: 'error', message: 'Invalid JSON' });
       return;
     }
 
-    msg.from = deviceId;
-    msg.timestamp = msg.timestamp || Date.now();
+    msg = {
+      ...msg,
+      from: deviceId,
+      timestamp: msg.timestamp || Date.now(),
+    };
 
     switch (msg.type) {
       case 'ping':
         this.send(conn.ws, { type: 'pong' });
         break;
 
+      case 'ack':
+        this.handleAck(msg);
+        break;
+
       case 'command':
-        this.handleCommand(msg as CommandMessage, conn.device);
+        this.handleCommand(msg, conn.device);
         break;
 
       case 'token':
@@ -110,25 +162,19 @@ export class AIMRelay {
       case 'audio':
       case 'audioEnd':
       case 'error':
-        // Route to target device or broadcast
         if (msg.to) {
           this.sendToDevice(msg.to, msg);
         } else {
-          // Broadcast to all except sender
           this.broadcast(msg, deviceId);
         }
         break;
 
       case 'status':
-        // Status updates go to everyone
         this.broadcast(msg);
         break;
 
       case 'route':
-        // Explicit routing: send to a specific device
-        if (msg.to) {
-          this.sendToDevice(msg.to, msg);
-        }
+        this.sendToDevice(msg.to, msg);
         break;
 
       case 'broadcast':
@@ -143,7 +189,6 @@ export class AIMRelay {
         break;
 
       default:
-        // Forward unknown types — extensible protocol
         if (msg.to) {
           this.sendToDevice(msg.to, msg);
         } else {
@@ -152,51 +197,38 @@ export class AIMRelay {
     }
   }
 
-  /**
-   * Handle a command message.
-   * Routes to the AI backend handler, or forwards to the target device.
-   */
   private handleCommand(msg: CommandMessage, from: ConnectedDevice): void {
     console.log(`[AIM] Command from ${from.deviceName}: "${msg.text}"`);
 
-    // If respondTo is set, the response should go to that device
-    // Otherwise, response goes back to sender
     if (!msg.respondTo) {
       msg.respondTo = from.id;
     }
 
-    // If there's a registered command handler (AI backend), use it
-    if (this.commandHandler) {
-      this.commandHandler(msg, from);
+    if (this.commandHandlers.length > 0) {
+      for (const handler of this.commandHandlers) {
+        try {
+          handler(msg, from);
+        } catch (err) {
+          console.error('[AIM] Command handler error:', err);
+        }
+      }
       return;
     }
 
-    // Otherwise, route to the first 'mac' or 'cli' device (the AI backend)
     const backend = this.findBackend();
     if (backend) {
-      this.send(backend.ws, msg);
-    } else {
-      // No backend connected — send error back to sender
-      const senderConn = this.devices.get(from.id);
-      if (senderConn) {
-        this.send(senderConn.ws, {
-          type: 'error',
-          message: 'No AI backend connected',
-          requestId: msg.requestId,
-        });
-      }
+      this.sendToDevice(backend.device.id, msg);
+      return;
     }
+
+    this.sendToPreferredTargets(['server', 'mac', 'cli'], msg);
   }
 
-  /**
-   * Find the AI backend device (server, mac, or cli type).
-   * Priority: server (VPS JARVIS) > mac > cli
-   */
   private findBackend(): DeviceConnection | null {
     let macConn: DeviceConnection | null = null;
     for (const [, conn] of this.devices) {
       if (conn.device.deviceType === 'server') {
-        return conn; // Server (VPS) has highest priority
+        return conn;
       }
       if (conn.device.deviceType === 'mac' || conn.device.deviceType === 'cli') {
         macConn = conn;
@@ -205,10 +237,6 @@ export class AIMRelay {
     return macConn;
   }
 
-  /**
-   * Send a response to the appropriate device(s) based on respondTo.
-   * Called by the AI backend after processing a command.
-   */
   sendResponse(msg: AIMMessage, respondTo?: string): void {
     if (respondTo) {
       this.sendToDevice(respondTo, msg);
@@ -217,33 +245,10 @@ export class AIMRelay {
     }
   }
 
-  /**
-   * Send to a specific device by ID or device type.
-   */
   sendToDevice(target: string, msg: AIMMessage): boolean {
-    // Try by ID first
-    let conn = this.devices.get(target);
-
-    // Try by device type if not found by ID
-    if (!conn) {
-      for (const [, c] of this.devices) {
-        if (c.device.deviceType === target || c.device.deviceName === target) {
-          conn = c;
-          break;
-        }
-      }
-    }
-
-    if (conn && conn.ws.readyState === WebSocket.OPEN) {
-      this.send(conn.ws, msg);
-      return true;
-    }
-    return false;
+    return this.sendToPreferredTargets([target], msg);
   }
 
-  /**
-   * Broadcast a message to all connected devices (optionally excluding sender).
-   */
   broadcast(msg: AIMMessage, excludeId?: string): void {
     const data = JSON.stringify(msg);
     for (const [id, conn] of this.devices) {
@@ -253,16 +258,12 @@ export class AIMRelay {
     }
   }
 
-  /**
-   * Remove a disconnected device.
-   */
   removeDevice(deviceId: string): void {
     const conn = this.devices.get(deviceId);
     if (conn) {
       console.log(`[AIM] Device disconnected: ${conn.device.deviceName} [${deviceId}]`);
       this.devices.delete(deviceId);
 
-      // Notify remaining devices
       this.broadcast({
         type: 'status',
         state: 'device_disconnected',
@@ -272,10 +273,7 @@ export class AIMRelay {
     }
   }
 
-  /**
-   * Get list of connected devices (public info only).
-   */
-  getDeviceList(): Partial<ConnectedDevice>[] {
+  getDeviceList(): Array<Pick<ConnectedDevice, 'id' | 'deviceType' | 'deviceName' | 'capabilities'>> {
     return Array.from(this.devices.values()).map(c => ({
       id: c.device.id,
       deviceType: c.device.deviceType,
@@ -284,16 +282,10 @@ export class AIMRelay {
     }));
   }
 
-  /**
-   * Get a specific device by ID.
-   */
   getDevice(id: string): ConnectedDevice | null {
     return this.devices.get(id)?.device || null;
   }
 
-  /**
-   * Start heartbeat checking.
-   */
   startHeartbeat(): void {
     this.heartbeatInterval = setInterval(() => {
       const now = Date.now();
@@ -309,28 +301,306 @@ export class AIMRelay {
     }, this.heartbeatMs);
   }
 
-  /**
-   * Stop heartbeat checking.
-   */
   stopHeartbeat(): void {
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
-  }
 
-  /**
-   * Send a message to a WebSocket.
-   */
-  private send(ws: WebSocket, msg: AIMMessage | Record<string, any>): void {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(msg));
+    for (const deliveryId of this.pendingDeliveries.keys()) {
+      this.clearPendingDelivery(deliveryId);
     }
   }
 
-  /**
-   * Get connected device count.
-   */
+  private handleAck(msg: AckMessage): void {
+    if (msg.ackType === 'delivery' && msg.deliveryId) {
+      this.clearPendingDelivery(msg.deliveryId);
+    }
+  }
+
+  private sendToPreferredTargets(targetHints: string[], msg: AIMMessage): boolean {
+    const requireAck = this.requiresDeliveryAck(msg);
+    const preparedMessage = this.prepareOutgoingMessage(msg, requireAck);
+    const targetConn = this.resolveDeviceConnection(targetHints);
+
+    if (!targetConn) {
+      this.queueDelivery(targetHints, preparedMessage, requireAck);
+      return false;
+    }
+
+    return this.deliverToConnection(targetHints, targetConn, preparedMessage, requireAck);
+  }
+
+  private deliverToConnection(
+    targetHints: string[],
+    conn: DeviceConnection,
+    msg: AIMMessage,
+    requireAck: boolean,
+  ): boolean {
+    const deliveryId = msg.deliveryId;
+    const sendSucceeded = this.send(conn.ws, msg, (err) => {
+      console.error(`[AIM] Failed to send ${msg.type} to ${conn.device.deviceName}:`, err.message);
+      if (deliveryId) {
+        this.scheduleRetry(deliveryId);
+      } else {
+        this.queueDelivery(targetHints, msg, requireAck);
+      }
+    });
+
+    if (!sendSucceeded) {
+      this.queueDelivery(targetHints, msg, requireAck);
+      return false;
+    }
+
+    if (requireAck) {
+      this.trackPendingAck(targetHints, msg);
+    } else if (deliveryId) {
+      this.clearPendingDelivery(deliveryId);
+    }
+
+    return true;
+  }
+
+  private queueDelivery(targetHints: string[], msg: AIMMessage, requireAck: boolean): void {
+    const deliveryId = msg.deliveryId || `delivery-${uuid()}`;
+    const existing = this.pendingDeliveries.get(deliveryId);
+    const message = this.prepareOutgoingMessage({ ...msg, deliveryId }, requireAck);
+
+    if (existing) {
+      existing.targetHints = targetHints;
+      existing.message = message;
+      existing.requireAck = requireAck;
+      existing.awaitingAck = false;
+      if (existing.ackTimer) {
+        clearTimeout(existing.ackTimer);
+        existing.ackTimer = null;
+      }
+      this.scheduleRetry(deliveryId);
+      return;
+    }
+
+    const pending: PendingDelivery = {
+      targetHints,
+      message,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + this.resilienceConfig.offlineMessageTtlMs,
+      attempts: 0,
+      requireAck,
+      retryTimer: null,
+      ackTimer: null,
+      awaitingAck: false,
+    };
+
+    this.pendingDeliveries.set(deliveryId, pending);
+    this.scheduleRetry(deliveryId);
+  }
+
+  private trackPendingAck(targetHints: string[], msg: AIMMessage): void {
+    const deliveryId = msg.deliveryId;
+    if (!deliveryId) {
+      return;
+    }
+
+    const existing = this.pendingDeliveries.get(deliveryId);
+    const pending = existing || {
+      targetHints,
+      message: msg,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + this.resilienceConfig.offlineMessageTtlMs,
+      attempts: 0,
+      requireAck: true,
+      retryTimer: null,
+      ackTimer: null,
+      awaitingAck: false,
+    } satisfies PendingDelivery;
+
+    pending.targetHints = targetHints;
+    pending.message = msg;
+    pending.requireAck = true;
+    pending.awaitingAck = true;
+
+    if (pending.retryTimer) {
+      clearTimeout(pending.retryTimer);
+      pending.retryTimer = null;
+    }
+    if (pending.ackTimer) {
+      clearTimeout(pending.ackTimer);
+    }
+
+    pending.ackTimer = setTimeout(() => {
+      pending.awaitingAck = false;
+      pending.ackTimer = null;
+      this.scheduleRetry(deliveryId);
+    }, this.resilienceConfig.ackTimeoutMs);
+
+    this.pendingDeliveries.set(deliveryId, pending);
+  }
+
+  private flushPendingDeliveriesFor(device: ConnectedDevice): void {
+    for (const [deliveryId, pending] of this.pendingDeliveries) {
+      if (pending.targetHints.some(target => this.matchesTarget(device, target))) {
+        this.scheduleRetry(deliveryId, 0);
+      }
+    }
+  }
+
+  private scheduleRetry(deliveryId: string, overrideDelayMs?: number): void {
+    const pending = this.pendingDeliveries.get(deliveryId);
+    if (!pending) {
+      return;
+    }
+
+    if (Date.now() > pending.expiresAt) {
+      this.dropExpiredDelivery(deliveryId, pending);
+      return;
+    }
+
+    if (pending.retryTimer) {
+      clearTimeout(pending.retryTimer);
+    }
+    if (pending.ackTimer) {
+      clearTimeout(pending.ackTimer);
+      pending.ackTimer = null;
+    }
+
+    const delayMs = overrideDelayMs ?? this.getRetryDelay(pending.attempts);
+    if (overrideDelayMs === undefined) {
+      pending.attempts += 1;
+    }
+
+    pending.retryTimer = setTimeout(() => {
+      pending.retryTimer = null;
+      this.processPendingDelivery(deliveryId);
+    }, delayMs);
+  }
+
+  private processPendingDelivery(deliveryId: string): void {
+    const pending = this.pendingDeliveries.get(deliveryId);
+    if (!pending) {
+      return;
+    }
+
+    if (Date.now() > pending.expiresAt) {
+      this.dropExpiredDelivery(deliveryId, pending);
+      return;
+    }
+
+    if (pending.awaitingAck) {
+      return;
+    }
+
+    const conn = this.resolveDeviceConnection(pending.targetHints);
+    if (!conn) {
+      this.scheduleRetry(deliveryId);
+      return;
+    }
+
+    this.deliverToConnection(pending.targetHints, conn, pending.message, pending.requireAck);
+  }
+
+  private dropExpiredDelivery(deliveryId: string, pending: PendingDelivery): void {
+    const errorMessage: ErrorMessage = {
+      type: 'error',
+      message: `Queued ${pending.message.type} expired before target came back online`,
+      requestId: pending.message.requestId,
+      to: pending.message.from,
+      details: {
+        targetHints: pending.targetHints,
+        deliveryId,
+        ttlMs: this.resilienceConfig.offlineMessageTtlMs,
+      },
+    };
+
+    console.warn(`[AIM] Dropping expired queued message ${deliveryId} for ${pending.targetHints.join(', ')}`);
+    this.clearPendingDelivery(deliveryId);
+
+    if (errorMessage.to) {
+      this.sendToDevice(errorMessage.to, errorMessage);
+    }
+  }
+
+  private resolveDeviceConnection(targetHints: string[]): DeviceConnection | null {
+    for (const target of targetHints) {
+      const byId = this.devices.get(target);
+      if (byId && byId.ws.readyState === WebSocket.OPEN) {
+        return byId;
+      }
+
+      for (const [, conn] of this.devices) {
+        if (this.matchesTarget(conn.device, target) && conn.ws.readyState === WebSocket.OPEN) {
+          return conn;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private matchesTarget(device: ConnectedDevice, target: string): boolean {
+    return device.id === target || device.deviceType === target || device.deviceName === target;
+  }
+
+  private prepareOutgoingMessage(msg: AIMMessage, requireAck: boolean): AIMMessage {
+    if (requireAck) {
+      return {
+        ...msg,
+        deliveryId: msg.deliveryId || `delivery-${uuid()}`,
+        requiresAck: true,
+      };
+    }
+
+    if (!msg.deliveryId) {
+      return msg;
+    }
+
+    return {
+      ...msg,
+      requiresAck: false,
+    };
+  }
+
+  private requiresDeliveryAck(msg: AIMMessage): boolean {
+    return CRITICAL_MESSAGE_TYPES.has(msg.type) || msg.requiresAck === true;
+  }
+
+  private getRetryDelay(attempts: number): number {
+    return Math.min(this.resilienceConfig.retryBaseMs * 2 ** attempts, this.resilienceConfig.retryCapMs);
+  }
+
+  private clearPendingDelivery(deliveryId: string): void {
+    const pending = this.pendingDeliveries.get(deliveryId);
+    if (!pending) {
+      return;
+    }
+
+    if (pending.retryTimer) {
+      clearTimeout(pending.retryTimer);
+    }
+    if (pending.ackTimer) {
+      clearTimeout(pending.ackTimer);
+    }
+
+    this.pendingDeliveries.delete(deliveryId);
+  }
+
+  private send(ws: WebSocket, msg: AIMMessage, onError?: (error: Error) => void): boolean {
+    if (ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    try {
+      ws.send(JSON.stringify(msg), (err) => {
+        if (err) {
+          onError?.(err);
+        }
+      });
+      return true;
+    } catch (err) {
+      onError?.(err instanceof Error ? err : new Error(String(err)));
+      return false;
+    }
+  }
+
   get deviceCount(): number {
     return this.devices.size;
   }
