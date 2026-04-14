@@ -6,14 +6,13 @@
  *   import { AIMClient } from 'aim-relay-server/client';
  *
  *   const client = new AIMClient({
- *     url: 'ws://your-vps:5225',
+ *     url: 'wss://your-relay.example.com',
  *     device: 'mac',
  *     name: 'MacBook Pro',
  *     token: 'your-auth-token',
  *   });
  *
  *   client.on('command', (msg) => {
- *     // Handle incoming command from another device
  *     console.log(msg.text);
  *   });
  *
@@ -27,7 +26,7 @@
 
 import WebSocket from 'ws';
 import { v4 as uuid } from 'uuid';
-import type { AIMMessage, DeviceType, CommandMessage } from './types.js';
+import type { AIMMessage, DeviceType, CommandMessage, AckMessage, ErrorMessage, StatusMessage } from './types.js';
 
 export interface AIMClientConfig {
   url: string;
@@ -43,14 +42,20 @@ export interface AIMClientConfig {
 
 type MessageHandler = (msg: AIMMessage) => void;
 
+const DEFAULT_RECONNECT_INTERVAL_MS = 3000;
+const RECONNECT_BACKOFF_STEPS_MS = [3000, 6000, 12000, 30000, 60000] as const;
+const SEEN_DELIVERY_TTL_MS = 5 * 60 * 1000;
+
 export class AIMClient {
   private ws: WebSocket | null = null;
   private config: Required<AIMClientConfig>;
   private handlers: Map<string, MessageHandler[]> = new Map();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
+  private seenDeliveries: Map<string, number> = new Map();
   private _connected = false;
   private _deviceId: string | null = null;
+  private _reconnectAttempts = 0;
 
   constructor(config: AIMClientConfig) {
     this.config = {
@@ -61,38 +66,34 @@ export class AIMClient {
       id: config.id || uuid(),
       capabilities: config.capabilities || [],
       reconnect: config.reconnect ?? true,
-      reconnectInterval: config.reconnectInterval || 3000,
+      reconnectInterval: config.reconnectInterval || DEFAULT_RECONNECT_INTERVAL_MS,
       pingInterval: config.pingInterval || 15000,
     };
   }
 
-  /**
-   * Connect to the AIM relay server.
-   */
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const params = new URLSearchParams({
-        device: this.config.device,
-        name: this.config.name,
-        id: this.config.id,
-      });
+      let settled = false;
+      const endpoint = new URL(this.config.url);
+      endpoint.searchParams.set('device', this.config.device);
+      endpoint.searchParams.set('name', this.config.name);
+      endpoint.searchParams.set('id', this.config.id);
       if (this.config.token) {
-        params.set('token', this.config.token);
+        endpoint.searchParams.set('token', this.config.token);
       }
 
-      const url = `${this.config.url}?${params}`;
-
       try {
-        this.ws = new WebSocket(url);
+        this.ws = new WebSocket(endpoint);
       } catch (err) {
+        settled = true;
         reject(err);
         return;
       }
 
       this.ws.on('open', () => {
         this._connected = true;
+        this._reconnectAttempts = 0;
 
-        // Send full registration with capabilities
         this.send({
           type: 'register',
           deviceType: this.config.device,
@@ -103,22 +104,47 @@ export class AIMClient {
 
         this.startPing();
         this.emit('connected', { type: 'status', state: 'connected' });
-        resolve();
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
       });
 
       this.ws.on('message', (data) => {
+        const raw = data.toString();
+        let msg: AIMMessage;
+
         try {
-          const msg: AIMMessage = JSON.parse(data.toString());
-
-          if (msg.type === 'ack' && (msg as any).deviceId) {
-            this._deviceId = (msg as any).deviceId;
-          }
-
-          this.emit(msg.type, msg);
-          this.emit('message', msg); // catch-all
-        } catch {
-          // ignore malformed messages
+          msg = JSON.parse(raw) as AIMMessage;
+        } catch (err) {
+          const errorMessage: ErrorMessage = {
+            type: 'error',
+            message: 'Failed to parse incoming AIM message',
+            raw,
+            details: {
+              error: err instanceof Error ? err.message : String(err),
+            },
+          };
+          console.error('[AIM Client] Failed to parse incoming message:', err, raw);
+          this.emit('error', errorMessage);
+          return;
         }
+
+        if (msg.type === 'ack' && msg.deviceId) {
+          this._deviceId = msg.deviceId;
+        }
+
+        if (msg.deliveryId && msg.requiresAck) {
+          if (this.hasSeenDelivery(msg.deliveryId)) {
+            this.sendDeliveryAck(msg.deliveryId);
+            return;
+          }
+          this.markDeliverySeen(msg.deliveryId);
+          this.sendDeliveryAck(msg.deliveryId);
+        }
+
+        this.emit(msg.type, msg);
+        this.emit('message', msg);
       });
 
       this.ws.on('close', () => {
@@ -126,23 +152,26 @@ export class AIMClient {
         this.stopPing();
         this.emit('disconnected', { type: 'status', state: 'disconnected' });
 
+        if (!settled) {
+          settled = true;
+          reject(new Error('Connection closed before AIM client finished connecting'));
+        }
+
         if (this.config.reconnect) {
           this.scheduleReconnect();
         }
       });
 
       this.ws.on('error', (err) => {
-        if (!this._connected) {
+        if (!settled && !this._connected) {
+          settled = true;
           reject(err);
         }
-        this.emit('error', { type: 'error', message: err.message });
+        this.emit('error', { type: 'error', message: err.message, details: { phase: 'socket' } });
       });
     });
   }
 
-  /**
-   * Send a command to the relay.
-   */
   sendCommand(text: string, options: { respondTo?: string; noAudio?: boolean } = {}): string {
     const requestId = `req-${Date.now()}-${uuid().slice(0, 6)}`;
     this.send({
@@ -155,46 +184,28 @@ export class AIMClient {
     return requestId;
   }
 
-  /**
-   * Send a token (streaming response) to a specific device or broadcast.
-   */
   sendToken(text: string, to?: string, requestId?: string): void {
     this.send({ type: 'token', text, to, requestId });
   }
 
-  /**
-   * Send audio data to a specific device or broadcast.
-   */
   sendAudio(data: string, to?: string, requestId?: string): void {
     this.send({ type: 'audio', data, to, requestId });
   }
 
-  /**
-   * Signal end of audio stream.
-   */
   sendAudioEnd(to?: string, requestId?: string): void {
     this.send({ type: 'audioEnd', to, requestId });
   }
 
-  /**
-   * Broadcast a status update to all devices.
-   */
-  sendStatus(state: string, extra?: Record<string, any>): void {
-    this.send({ type: 'status', state, ...extra });
+  sendStatus(state: string, details?: Record<string, unknown>): void {
+    this.send({ type: 'status', state, details });
   }
 
-  /**
-   * Send a raw message.
-   */
-  send(msg: AIMMessage | Record<string, any>): void {
+  send(msg: AIMMessage): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
   }
 
-  /**
-   * Register an event handler.
-   */
   on(event: string, handler: MessageHandler): void {
     if (!this.handlers.has(event)) {
       this.handlers.set(event, []);
@@ -202,9 +213,6 @@ export class AIMClient {
     this.handlers.get(event)!.push(handler);
   }
 
-  /**
-   * Remove an event handler.
-   */
   off(event: string, handler: MessageHandler): void {
     const handlers = this.handlers.get(event);
     if (handlers) {
@@ -213,15 +221,12 @@ export class AIMClient {
     }
   }
 
-  /**
-   * Emit an event to all handlers.
-   */
-  private emit(event: string, msg: AIMMessage | Record<string, any>): void {
+  private emit(event: string, msg: AIMMessage): void {
     const handlers = this.handlers.get(event);
     if (handlers) {
       for (const handler of handlers) {
         try {
-          handler(msg as AIMMessage);
+          handler(msg);
         } catch (err) {
           console.error(`[AIM Client] Handler error for ${event}:`, err);
         }
@@ -229,9 +234,6 @@ export class AIMClient {
     }
   }
 
-  /**
-   * Disconnect from the relay.
-   */
   disconnect(): void {
     this.config.reconnect = false;
     this.stopPing();
@@ -247,6 +249,7 @@ export class AIMClient {
   }
 
   private startPing(): void {
+    this.stopPing();
     this.pingTimer = setInterval(() => {
       this.send({ type: 'ping' });
     }, this.config.pingInterval);
@@ -261,15 +264,77 @@ export class AIMClient {
 
   private scheduleReconnect(): void {
     if (this.reconnectTimer) return;
+
+    this._reconnectAttempts += 1;
+    const delay = this.getReconnectDelay();
+    const reconnectStatus: StatusMessage = {
+      type: 'status',
+      state: 'reconnect_scheduled',
+      details: {
+        attempt: this._reconnectAttempts,
+        delayMs: delay,
+      },
+    };
+
+    console.log(`[AIM Client] Reconnecting in ${delay}ms (attempt ${this._reconnectAttempts})`);
+    this.emit('reconnect', reconnectStatus);
+
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      console.log('[AIM Client] Reconnecting...');
       try {
         await this.connect();
-      } catch {
-        // Will retry via close handler
+      } catch (err) {
+        const errorMessage: ErrorMessage = {
+          type: 'error',
+          message: 'Reconnect attempt failed',
+          details: {
+            attempt: this._reconnectAttempts,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        };
+        console.error('[AIM Client] Reconnect attempt failed:', err);
+        this.emit('error', errorMessage);
       }
-    }, this.config.reconnectInterval);
+    }, delay);
+  }
+
+  private getReconnectDelay(): number {
+    const configuredBase = Math.max(this.config.reconnectInterval, DEFAULT_RECONNECT_INTERVAL_MS);
+    if (configuredBase !== DEFAULT_RECONNECT_INTERVAL_MS) {
+      return Math.min(configuredBase * 2 ** (this._reconnectAttempts - 1), 60000);
+    }
+
+    const index = Math.min(this._reconnectAttempts - 1, RECONNECT_BACKOFF_STEPS_MS.length - 1);
+    return RECONNECT_BACKOFF_STEPS_MS[index];
+  }
+
+  private sendDeliveryAck(deliveryId: string): void {
+    const ack: AckMessage = {
+      type: 'ack',
+      ackType: 'delivery',
+      deliveryId,
+      delivered: true,
+    };
+    this.send(ack);
+  }
+
+  private hasSeenDelivery(deliveryId: string): boolean {
+    this.pruneSeenDeliveries();
+    return this.seenDeliveries.has(deliveryId);
+  }
+
+  private markDeliverySeen(deliveryId: string): void {
+    this.pruneSeenDeliveries();
+    this.seenDeliveries.set(deliveryId, Date.now());
+  }
+
+  private pruneSeenDeliveries(): void {
+    const cutoff = Date.now() - SEEN_DELIVERY_TTL_MS;
+    for (const [deliveryId, seenAt] of this.seenDeliveries) {
+      if (seenAt < cutoff) {
+        this.seenDeliveries.delete(deliveryId);
+      }
+    }
   }
 
   get connected(): boolean {
@@ -278,5 +343,9 @@ export class AIMClient {
 
   get deviceId(): string | null {
     return this._deviceId;
+  }
+
+  get reconnectAttempts(): number {
+    return this._reconnectAttempts;
   }
 }

@@ -3,78 +3,27 @@
  * Defines the message format for the AIM relay protocol.
  */
 
-// Device types that can connect to AIM
 export type DeviceType = 'mac' | 'phone' | 'watch' | 'web' | 'cli' | 'server' | 'custom';
 
-// Message types flowing through AIM
 export type MessageType =
-  | 'register'       // Device registration
-  | 'command'         // Voice/text command from any device
-  | 'token'           // Streamed response token
-  | 'response'        // Complete response
-  | 'audio'           // Audio chunk (base64)
-  | 'audioEnd'        // End of audio stream
-  | 'status'          // Status broadcast (state changes)
-  | 'error'           // Error message
-  | 'ping'            // Keep-alive ping
-  | 'pong'            // Keep-alive pong
-  | 'route'           // Route a command to a specific device
-  | 'broadcast'       // Broadcast to all devices
-  | 'devices'         // List connected devices
-  | 'ack'             // Acknowledgment
-  | 'system_command'  // macOS command forwarded from server to Mac
-  | 'system_command_result'  // Result of macOS command from Mac to server
-  | 'play_audio';     // Audio playback request to Mac
+  | 'register'
+  | 'command'
+  | 'token'
+  | 'response'
+  | 'audio'
+  | 'audioEnd'
+  | 'status'
+  | 'error'
+  | 'ping'
+  | 'pong'
+  | 'route'
+  | 'broadcast'
+  | 'devices'
+  | 'ack'
+  | 'system_command'
+  | 'system_command_result'
+  | 'play_audio';
 
-// Base message structure
-export interface AIMMessage {
-  type: MessageType;
-  requestId?: string;
-  timestamp?: number;
-  from?: string;       // device ID of sender
-  to?: string;         // device ID of target (for routing)
-  [key: string]: any;
-}
-
-// Registration message
-export interface RegisterMessage extends AIMMessage {
-  type: 'register';
-  deviceType: DeviceType;
-  deviceName?: string;
-  capabilities?: string[];  // ['audio', 'display', 'microphone', 'tts', 'systemControl']
-}
-
-// Command message
-export interface CommandMessage extends AIMMessage {
-  type: 'command';
-  text: string;
-  noAudio?: boolean;
-  respondTo?: string;  // device ID where response should go
-}
-
-// Token message (streaming)
-export interface TokenMessage extends AIMMessage {
-  type: 'token';
-  text: string;
-  done?: boolean;
-}
-
-// Audio message
-export interface AudioMessage extends AIMMessage {
-  type: 'audio';
-  data: string;  // base64 encoded audio
-  format?: string; // 'mp3', 'wav', etc.
-}
-
-// Status message
-export interface StatusMessage extends AIMMessage {
-  type: 'status';
-  state: string;
-  lastCommand?: string;
-  respondingDevice?: string;
-}
-
-// Connected device info
 export interface ConnectedDevice {
   id: string;
   deviceType: DeviceType;
@@ -84,11 +33,125 @@ export interface ConnectedDevice {
   lastSeen: number;
 }
 
-// AIM server config
+interface AIMMessageBase<T extends MessageType> {
+  type: T;
+  requestId?: string;
+  timestamp?: number;
+  from?: string;
+  to?: string;
+  deliveryId?: string;
+  requiresAck?: boolean;
+}
+
+export interface RegisterMessage extends AIMMessageBase<'register'> {
+  deviceType: DeviceType;
+  deviceName?: string;
+  capabilities?: string[];
+}
+
+export interface CommandMessage extends AIMMessageBase<'command'> {
+  text: string;
+  noAudio?: boolean;
+  respondTo?: string;
+}
+
+export interface TokenMessage extends AIMMessageBase<'token'> {
+  text: string;
+  done?: boolean;
+}
+
+export interface ResponseMessage extends AIMMessageBase<'response'> {
+  text: string;
+  done?: boolean;
+}
+
+export interface AudioMessage extends AIMMessageBase<'audio'> {
+  data: string;
+  format?: string;
+}
+
+export interface AudioEndMessage extends AIMMessageBase<'audioEnd'> {}
+
+export interface StatusMessage extends AIMMessageBase<'status'> {
+  state: string;
+  lastCommand?: string;
+  respondingDevice?: string;
+  device?: Pick<ConnectedDevice, 'id' | 'deviceType' | 'deviceName'>;
+  connectedDevices?: Array<Pick<ConnectedDevice, 'id' | 'deviceType' | 'deviceName' | 'capabilities'>>;
+  details?: Record<string, unknown>;
+}
+
+export interface ErrorMessage extends AIMMessageBase<'error'> {
+  message: string;
+  code?: string;
+  raw?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface PingMessage extends AIMMessageBase<'ping'> {}
+
+export interface PongMessage extends AIMMessageBase<'pong'> {}
+
+export interface RouteMessage extends AIMMessageBase<'route'> {
+  to: string;
+}
+
+export interface BroadcastMessage extends AIMMessageBase<'broadcast'> {}
+
+export interface DevicesMessage extends AIMMessageBase<'devices'> {
+  devices?: Array<Pick<ConnectedDevice, 'id' | 'deviceType' | 'deviceName' | 'capabilities'>>;
+}
+
+export interface AckMessage extends AIMMessageBase<'ack'> {
+  ackType?: 'register' | 'delivery';
+  deliveryId?: string;
+  delivered?: boolean;
+  deviceId?: string;
+  message?: string;
+  connectedDevices?: Array<Pick<ConnectedDevice, 'id' | 'deviceType' | 'deviceName' | 'capabilities'>>;
+}
+
+export interface SystemCommandMessage extends AIMMessageBase<'system_command'> {
+  command: string;
+  args?: string[];
+}
+
+export interface SystemCommandResultMessage extends AIMMessageBase<'system_command_result'> {
+  success: boolean;
+  output?: string;
+  error?: string;
+}
+
+export interface PlayAudioMessage extends AIMMessageBase<'play_audio'> {
+  data?: string;
+  format?: string;
+  audioUrl?: string;
+  autoplay?: boolean;
+}
+
+export type AIMMessage =
+  | RegisterMessage
+  | CommandMessage
+  | TokenMessage
+  | ResponseMessage
+  | AudioMessage
+  | AudioEndMessage
+  | StatusMessage
+  | ErrorMessage
+  | PingMessage
+  | PongMessage
+  | RouteMessage
+  | BroadcastMessage
+  | DevicesMessage
+  | AckMessage
+  | SystemCommandMessage
+  | SystemCommandResultMessage
+  | PlayAudioMessage;
+
 export interface AIMConfig {
   port: number;
   authToken?: string;
   allowedOrigins?: string[];
-  heartbeatInterval?: number;  // ms, default 30000
-  maxMessageSize?: number;     // bytes, default 10MB
+  heartbeatInterval?: number;
+  maxMessageSize?: number;
 }
